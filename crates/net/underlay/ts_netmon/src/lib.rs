@@ -14,7 +14,9 @@ pub mod windows;
 
 pub use family::{Family, FamilyOrBoth};
 pub use id::{InterfaceId, MonType};
-pub use netmon::{BoxStream, Netmon, PlatformMon, platform_mon};
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+pub use netmon::PlatformMon;
+pub use netmon::{BoxStream, Netmon, platform_mon};
 
 /// An event produced by the network monitor.
 #[derive(Debug, Clone, PartialEq, Eq)]
