@@ -13,7 +13,7 @@ use core::{borrow::Borrow, hash::Hash, ops::Deref};
 use crate::{
     Error, GeneratedStorage, Owner, Result, iter,
     schema::{self, Desc, IndexDesc, IndexStorage, PrimaryDesc, SingletonDesc, TableDesc},
-    storage::{Storage, Table, VersionedValue},
+    storage::{SingletonSlot, Storage, Table},
     transactions::{TransactionRef, TxnId},
 };
 
@@ -39,9 +39,7 @@ pub trait StorageGuard<TableStorage: GeneratedStorage>: Sized {
     ///
     /// There must be no live mutable reference to the singleton described by `S` while the
     /// returned reference is live.
-    unsafe fn singleton<S: SingletonDesc<Storage = TableStorage>>(
-        &self,
-    ) -> &VersionedValue<Option<S::Value>>;
+    unsafe fn singleton<S: SingletonDesc<Storage = TableStorage>>(&self) -> &S::Slot;
 }
 
 impl<TableStorage: GeneratedStorage> StorageGuard<TableStorage> for Storage<TableStorage> {
@@ -53,12 +51,15 @@ impl<TableStorage: GeneratedStorage> StorageGuard<TableStorage> for Storage<Tabl
         D::get_table(&self.tables)
     }
 
-    unsafe fn singleton<S: SingletonDesc<Storage = TableStorage>>(
-        &self,
-    ) -> &VersionedValue<Option<S::Value>> {
+    unsafe fn singleton<S: SingletonDesc<Storage = TableStorage>>(&self) -> &S::Slot {
         S::get_ref(&self.tables)
     }
 }
+
+/// The result of an operation on the singleton `S`.
+///
+/// For a singleton declared with `default` this is `T`. Otherwise, it is `Option<T>`.
+type Maybe<S, T> = <<S as SingletonDesc>::Slot as SingletonSlot>::Maybe<T>;
 
 pub(crate) trait Ops<TableStorage: GeneratedStorage>: Sized {
     type ReadLock: Deref<Target: StorageGuard<TableStorage>>;
@@ -77,7 +78,7 @@ pub(crate) unsafe trait SingletonOps<TableStorage: GeneratedStorage>:
 {
     type Desc: SingletonDesc<Storage = TableStorage>;
 
-    fn get(self, owner: Owner) -> Option<<Self::Desc as SingletonDesc>::Value>
+    fn get(self, owner: Owner) -> Maybe<Self::Desc, <Self::Desc as SingletonDesc>::Value>
     where
         <Self::Desc as SingletonDesc>::Value: Clone,
     {
@@ -88,14 +89,11 @@ pub(crate) unsafe trait SingletonOps<TableStorage: GeneratedStorage>:
         self,
         f: impl FnOnce(&<Self::Desc as SingletonDesc>::Value) -> T,
         _owner: Owner,
-    ) -> Option<T> {
+    ) -> Maybe<Self::Desc, T> {
         let guard = self.read_lock();
         // SAFETY: `guard` is from `read_lock`, so by the trait's contract there are no mutable
         // references to `Self::Desc`'s value.
-        let value = unsafe { guard.singleton::<Self::Desc>() }
-            .get(guard.txn_id())?
-            .as_ref()?;
-        Some(f(value))
+        unsafe { guard.singleton::<Self::Desc>() }.with(guard.txn_id(), f)
     }
 }
 
@@ -316,31 +314,38 @@ pub(crate) trait OpsMut<'txn, D: Desc>: Sized {
 }
 
 pub(crate) trait SingletonOpsMut<'txn, D: schema::SingletonDesc>: OpsMut<'txn, D> {
-    fn insert(self, value: D::Value, owner: Owner) {
+    /// Run `f` on the underlying singleton storage, checking that `owner` owns it.
+    ///
+    /// The write lock is held while `f` runs.
+    #[track_caller]
+    fn with_singleton_mut<T>(self, owner: Owner, f: impl FnOnce(&mut D::Slot, TxnId) -> T) -> T {
         let mut guard = self.write_lock();
         assert_owner(D::OWNER, owner);
         let txn_id = guard.txn_id();
 
-        guard.singleton_mut().set(Some(value), txn_id);
+        f(guard.singleton_mut(), txn_id)
+    }
+
+    fn insert(self, value: D::Value, owner: Owner) {
+        self.with_singleton_mut(owner, |slot, txn_id| slot.insert(value, txn_id))
     }
 
     fn delete(self, owner: Owner) {
-        let mut guard = self.write_lock();
-        assert_owner(D::OWNER, owner);
-        let txn_id = guard.txn_id();
-
-        guard.singleton_mut().set(None, txn_id);
+        self.with_singleton_mut(owner, |slot, txn_id| slot.delete(txn_id))
     }
 
-    fn with_mut<T>(self, f: impl FnOnce(&mut D::Value) -> T, owner: Owner) -> Option<T>
+    fn remove(self, owner: Owner) -> Maybe<D, D::Value>
+    where
+        D::Value: Clone,
+    {
+        self.with_singleton_mut(owner, |slot, txn_id| slot.remove(txn_id))
+    }
+
+    fn with_mut<T>(self, f: impl FnOnce(&mut D::Value) -> T, owner: Owner) -> Maybe<D, T>
     where
         D::Value: Clone + PartialEq,
     {
-        let mut guard = self.write_lock();
-        assert_owner(D::OWNER, owner);
-        let txn_id = guard.txn_id();
-
-        guard.singleton_mut().with_mut_value(txn_id, f)
+        self.with_singleton_mut(owner, |slot, txn_id| slot.with_mut(txn_id, f))
     }
 }
 
