@@ -11,8 +11,8 @@
 use core::{borrow::Borrow, hash::Hash, ops::Deref};
 
 use crate::{
-    Error, GeneratedStorage, Owner, Result, iter,
-    schema::{self, Desc, IndexDesc, IndexStorage, PrimaryDesc, SingletonDesc, TableDesc},
+    GeneratedStorage, Owner, Result, iter,
+    schema::{self, Desc, IndexDesc, PrimaryDesc, SingletonDesc, TableDesc},
     storage::{SingletonSlot, Storage, Table},
     transactions::{TransactionRef, TxnId},
 };
@@ -108,23 +108,28 @@ pub(crate) unsafe trait TabularOps<TableStorage: GeneratedStorage>:
 {
     type Desc: TableDesc<Storage = TableStorage>;
 
-    fn len(self) -> usize {
+    /// Run `f` on the table.
+    ///
+    /// The read lock is held while `f` runs.
+    fn with_table<T>(self, f: impl FnOnce(&Table<Self::Desc>, TxnId) -> T) -> T {
         let guard = self.read_lock();
         // SAFETY: `guard` is from `read_lock` (see the trait's contract).
-        unsafe { guard.table::<Self::Desc>() }.len(guard.txn_id())
+        f(unsafe { guard.table::<Self::Desc>() }, guard.txn_id())
+    }
+
+    fn len(self) -> usize {
+        self.with_table(|table, txn_id| table.len(txn_id))
     }
 
     #[allow(clippy::wrong_self_convention)]
     fn is_empty(self) -> bool {
-        let guard = self.read_lock();
-        // SAFETY: `guard` is from `read_lock` (see the trait's contract).
-        unsafe { guard.table::<Self::Desc>() }.is_empty(guard.txn_id())
+        self.with_table(|table, txn_id| table.is_empty(txn_id))
     }
 
-    fn get<Q>(self, key: &Q, owner: Owner) -> Option<<Self::Desc as TableDesc>::Value>
+    fn get<Q>(self, key: &Q, owner: Owner) -> Option<Value<Self::Desc>>
     where
-        <Self::Desc as TableDesc>::Value: Clone,
-        <Self::Desc as TableDesc>::Key: Borrow<Q>,
+        Value<Self::Desc>: Clone,
+        Key<Self::Desc>: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
         self.with(key, Clone::clone, owner)
@@ -133,28 +138,20 @@ pub(crate) unsafe trait TabularOps<TableStorage: GeneratedStorage>:
     fn with<Q, T>(
         self,
         key: &Q,
-        f: impl FnOnce(&<Self::Desc as TableDesc>::Value) -> T,
+        f: impl FnOnce(&Value<Self::Desc>) -> T,
         _owner: Owner,
     ) -> Option<T>
     where
-        <Self::Desc as TableDesc>::Key: Borrow<Q>,
+        Key<Self::Desc>: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
-        let guard = self.read_lock();
-        // SAFETY: `guard` is from `read_lock` (see the trait's contract).
-        let value = unsafe { guard.table::<Self::Desc>() }.get(key, guard.txn_id())?;
-        Some(f(value))
+        self.with_table(|table, txn_id| table.get(key, txn_id).map(f))
     }
 
     fn with_iter<T>(
         self,
         f: impl for<'a> FnOnce(
-            &mut dyn Iterator<
-                Item = (
-                    &'a <Self::Desc as TableDesc>::Key,
-                    &'a <Self::Desc as TableDesc>::Value,
-                ),
-            >,
+            &mut dyn Iterator<Item = (&'a Key<Self::Desc>, &'a Value<Self::Desc>)>,
         ) -> T,
     ) -> T {
         let guard = self.read_lock();
@@ -164,23 +161,21 @@ pub(crate) unsafe trait TabularOps<TableStorage: GeneratedStorage>:
 
     fn with_keys<T>(
         self,
-        f: impl for<'a> FnOnce(&mut dyn Iterator<Item = &'a <Self::Desc as TableDesc>::Key>) -> T,
+        f: impl for<'a> FnOnce(&mut dyn Iterator<Item = &'a Key<Self::Desc>>) -> T,
     ) -> T {
-        let guard = self.read_lock();
-        // SAFETY: `guard` is from `read_lock` (see the trait's contract).
-        f(&mut unsafe { iter::table_iter::<Self::Desc>(&*guard) }.map(|(k, _)| k))
+        self.with_iter(|iter| f(&mut iter.map(|(k, _)| k)))
     }
 
     fn with_values<T>(
         self,
-        f: impl for<'a> FnOnce(&mut dyn Iterator<Item = &'a <Self::Desc as TableDesc>::Value>) -> T,
+        f: impl for<'a> FnOnce(&mut dyn Iterator<Item = &'a Value<Self::Desc>>) -> T,
     ) -> T {
-        let guard = self.read_lock();
-        // SAFETY: `guard` is from `read_lock` (see the trait's contract).
-        f(&mut unsafe { iter::table_iter::<Self::Desc>(&*guard) }.map(|(_, v)| v))
+        self.with_iter(|iter| f(&mut iter.map(|(_, v)| v)))
     }
 }
 
+pub(crate) type Key<T> = <T as TableDesc>::Key;
+pub(crate) type Value<T> = <T as TableDesc>::Value;
 pub(crate) type BaseKey<T> = <<T as IndexDesc>::BaseTable as TableDesc>::Key;
 pub(crate) type BaseValue<T> = <<T as IndexDesc>::BaseTable as TableDesc>::Value;
 pub(crate) type IndexKey<T> = <T as TableDesc>::Key;
@@ -234,16 +229,10 @@ pub(crate) unsafe trait IndexedOps<TableStorage: GeneratedStorage>:
         // contract).
         unsafe { check_consistent::<Self::IndexDesc>(&*guard) }?;
         let txn_id = guard.txn_id();
-        let Some(base_key) = unsafe { guard.table::<Self::IndexDesc>() }.get(key, txn_id) else {
-            return Ok(None);
-        };
-        let Some(value) = unsafe { guard.table::<<Self::IndexDesc as IndexDesc>::BaseTable>() }
-            .get(base_key, txn_id)
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(f(base_key, value)))
+        let base = unsafe { guard.table::<<Self::IndexDesc as IndexDesc>::BaseTable>() };
+        Ok(unsafe { guard.table::<Self::IndexDesc>() }
+            .get(key, txn_id)
+            .and_then(|base_key| Some(f(base_key, base.get(base_key, txn_id)?))))
     }
 
     #[allow(clippy::type_complexity)]
@@ -274,9 +263,7 @@ pub(crate) unsafe trait IndexedOps<TableStorage: GeneratedStorage>:
     where
         IndexValue<Self::IndexDesc>: Hash + Eq,
     {
-        let guard = self.read_lock();
-        // SAFETY: `guard` is from `read_lock` (see the trait's contract).
-        f(&mut unsafe { iter::index_iter::<Self::IndexDesc>(&*guard) }.map(|(k, ..)| k))
+        self.with_iter(|iter| f(&mut iter.map(|(k, ..)| k)))
     }
 
     #[allow(clippy::type_complexity)]
@@ -289,9 +276,7 @@ pub(crate) unsafe trait IndexedOps<TableStorage: GeneratedStorage>:
     where
         IndexValue<Self::IndexDesc>: Hash + Eq,
     {
-        let guard = self.read_lock();
-        // SAFETY: `guard` is from `read_lock` (see the trait's contract).
-        f(&mut unsafe { iter::index_iter::<Self::IndexDesc>(&*guard) }.map(|(_, bk, v)| (bk, v)))
+        self.with_iter(|iter| f(&mut iter.map(|(_, bk, v)| (bk, v))))
     }
 }
 
@@ -302,11 +287,7 @@ pub(crate) unsafe trait IndexedOps<TableStorage: GeneratedStorage>:
 /// Precondition: there must be no live mutable reference to the table described by `D`.
 unsafe fn check_consistent<D: IndexDesc>(guard: &impl StorageGuard<D::Storage>) -> Result<()> {
     // SAFETY: guaranteed by the precondition.
-    if unsafe { guard.table::<D>() }.is_poisoned(guard.txn_id()) {
-        Err(Error::NonUniqueIndexKey(D::NAME))
-    } else {
-        Ok(())
-    }
+    unsafe { guard.table::<D>() }.check_poisoned(guard.txn_id())
 }
 
 pub(crate) trait OpsMut<'txn, D: Desc>: Sized {
@@ -364,18 +345,11 @@ pub(crate) trait TabularOpsMut<'txn, D: PrimaryDesc>: OpsMut<'txn, D> {
     }
 
     fn clear(self, owner: Owner) {
-        self.with_table_mut(owner, |table, txn_id| {
-            table.clear(txn_id);
-        })
+        self.with_table_mut(owner, |table, txn_id| table.clear(txn_id))
     }
 
-    fn insert(self, key: D::Key, value: D::Value, owner: Owner)
-    where
-        D::Key: Clone,
-    {
-        self.with_table_mut(owner, |table, txn_id| {
-            table.insert(key, value, txn_id);
-        })
+    fn insert(self, key: D::Key, value: D::Value, owner: Owner) {
+        self.with_table_mut(owner, |table, txn_id| table.insert(key, value, txn_id))
     }
 
     fn with_mut<Q, T>(self, key: &Q, f: impl FnOnce(&mut D::Value) -> T, owner: Owner) -> Option<T>
@@ -392,9 +366,7 @@ pub(crate) trait TabularOpsMut<'txn, D: PrimaryDesc>: OpsMut<'txn, D> {
         D::Key: Borrow<Q>,
         Q: ?Sized + Hash + Eq + ToOwned<Owned = D::Key>,
     {
-        self.with_table_mut(owner, |table, txn_id| {
-            table.delete(key, txn_id);
-        })
+        self.with_table_mut(owner, |table, txn_id| table.delete(key, txn_id))
     }
 
     fn with_iter_mut<T>(
@@ -405,30 +377,14 @@ pub(crate) trait TabularOpsMut<'txn, D: PrimaryDesc>: OpsMut<'txn, D> {
     where
         D::Value: Clone + PartialEq,
     {
-        self.with_table_mut(owner, |table, txn_id| {
-            if !<D::IndexStorage as IndexStorage<_, _>>::HAS_INDEXES {
-                return f(&mut table.iter_mut(txn_id));
-            }
-
-            let mut yielded = Vec::new();
-            let result = f(&mut table
-                .iter_mut(txn_id)
-                .inspect(|(k, _)| yielded.push((*k).clone())));
-
-            for k in &yielded {
-                table.rebuild_indexes_for_key(k, txn_id);
-            }
-            result
-        })
+        self.with_table_mut(owner, |table, txn_id| table.with_iter_mut(txn_id, f))
     }
 
     fn retain(self, owner: Owner, f: impl FnMut(&D::Key, &mut D::Value) -> bool)
     where
         D::Value: Clone + PartialEq,
     {
-        self.with_table_mut(owner, |table, txn_id| {
-            table.retain(f, txn_id);
-        })
+        self.with_table_mut(owner, |table, txn_id| table.retain(f, txn_id))
     }
 
     fn with_values_mut<T>(

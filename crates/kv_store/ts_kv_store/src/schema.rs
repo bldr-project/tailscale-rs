@@ -999,41 +999,36 @@ macro_rules! on_insert_each {
         $name:ident,
         $field:ident :
         $field_ty:ty;
-        ($self:ident, $key:ident, $value:ident, $txn_id:ident); assert_unique
+        ($self:ident, $key:ident, $value:ident, $txn_id:ident) $(; $unique:ident)?
     ) => {
         for index_key in index::$name::Storage::$field($value) {
-            let unique = $self.$field.get::<$field_ty>(&index_key, $txn_id).is_none();
-            ::core::assert!(
-                unique,
-                "Index key is non-unique for index `{}` of table `{}`",
-                ::core::stringify!($field),
-                ::core::stringify!($name),
-            );
-            $self.$field.insert(
-                index_key,
-                $crate::__alloc::borrow::ToOwned::to_owned($key),
-                $txn_id,
-            );
-        }
-    };
-    (
-        $name:ident,
-        $field:ident :
-        $field_ty:ty;
-        ($self:ident, $key:ident, $value:ident, $txn_id:ident)
-    ) => {
-        for index_key in index::$name::Storage::$field($value) {
-            let unique = $self.$field.get::<$field_ty>(&index_key, $txn_id).is_none();
-            if unique {
+            if $self.$field.get::<$field_ty>(&index_key, $txn_id).is_none() {
                 $self.$field.insert(
                     index_key,
                     $crate::__alloc::borrow::ToOwned::to_owned($key),
                     $txn_id,
                 );
             } else {
-                $self.$field.set_poisoned($txn_id);
+                $crate::on_non_unique_index_key!($name, $field, $self, $txn_id $(; $unique)?);
             }
         }
+    };
+}
+
+/// Handle a non-unique index key: panic for an index declared with `assert_unique`, otherwise
+/// poison the index.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! on_non_unique_index_key {
+    ($name:ident, $field:ident, $self:ident, $txn_id:ident; assert_unique) => {
+        ::core::panic!(
+            "Index key is non-unique for index `{}` of table `{}`",
+            ::core::stringify!($field),
+            ::core::stringify!($name),
+        )
+    };
+    ($name:ident, $field:ident, $self:ident, $txn_id:ident) => {
+        $self.$field.set_poisoned($txn_id)
     };
 }
 
