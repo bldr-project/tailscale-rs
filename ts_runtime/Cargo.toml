@@ -11,24 +11,25 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Our crates.
-ts_bart.workspace = true
-ts_bart_packetfilter.workspace = true
-ts_control.workspace = true
-ts_dataplane.workspace = true
-ts_disco_protocol.workspace = true
-ts_keys.workspace = true
-ts_netcheck.workspace = true
-ts_netmon.workspace = true
-ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
-ts_overlay_router.workspace = true
-ts_packet.workspace = true
-ts_packetfilter = { workspace = true, features = ["checking-filter"] }
-ts_packetfilter_state.workspace = true
-ts_transport.workspace = true
-ts_derp.workspace = true
-ts_tunnel.workspace = true
-ts_hexdump.workspace = true
+# Our crates, from crates.io: the crates bldr-project patches in only this one, and the
+# `tailscale` crate it builds with links against these.
+ts_bart = "=0.6.1"
+ts_bart_packetfilter = "=0.6.1"
+ts_control = "=0.6.1"
+ts_dataplane = "=0.6.1"
+ts_disco_protocol = "=0.6.1"
+ts_keys = "=0.6.1"
+ts_netcheck = "=0.6.1"
+ts_netmon = "=0.6.1"
+ts_netstack_smoltcp = { version = "=0.6.1", features = ["tokio"] }
+ts_overlay_router = "=0.6.1"
+ts_packet = "=0.6.1"
+ts_packetfilter = { version = "=0.6.1", features = ["checking-filter"] }
+ts_packetfilter_state = "=0.6.1"
+ts_transport = "=0.6.1"
+ts_derp = "=0.6.1"
+ts_tunnel = "=0.6.1"
+ts_hexdump = "=0.6.1"
 
 # Unconditionally required dependencies.
 futures.workspace = true
@@ -55,7 +56,7 @@ chrono.workspace = true
 itertools.workspace = true
 proptest.workspace = true
 tokio-test = "0.4"
-ts_capabilityversion.workspace = true
+ts_capabilityversion = "=0.6.1"
 
 [features]
 console = ["kameo/console"]
