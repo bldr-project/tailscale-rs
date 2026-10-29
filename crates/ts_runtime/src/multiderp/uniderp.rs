@@ -234,32 +234,55 @@ impl Runner {
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id))]
     async fn run(&mut self) -> Result<(), ts_derp::Error> {
         loop {
-            let pending = self.wait_for_activity().await;
+            let pending = match self.wait_for_activity().await {
+                Activity::Packets(ep, pkts) => Some((ep, pkts)),
+                Activity::HomeDerp => None,
+                Activity::Closed => {
+                    tracing::trace!("uniderp or dataplane gone, stopping derp client");
+                    return Ok(());
+                }
+            };
             let transport = self.connect(pending).await?;
             self.run_transport(transport).await?;
         }
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    async fn wait_for_activity(&mut self) -> Option<(DynEndpoint, Vec<PacketMut>)> {
+    async fn wait_for_activity(&mut self) -> Activity {
         tracing::trace!("waiting for packet activity or for this to become home derp");
 
         let mut from_dataplane = self.from_dataplane.lock().await;
 
-        while !*self.home_derp_rx.borrow_and_update() {
+        loop {
+            // The sender lives in the `Uniderp`: once it is dropped, `changed` returns
+            // immediately forever and this region can never become home again.
+            if self.home_derp_rx.has_changed().is_err() {
+                return Activity::Closed;
+            }
+
+            if *self.home_derp_rx.borrow_and_update() {
+                return Activity::HomeDerp;
+            }
+
             tokio::select! {
-                _ = self.home_derp_rx.changed() => {
+                changed = self.home_derp_rx.changed() => {
+                    if changed.is_err() {
+                        return Activity::Closed;
+                    }
+
                     tracing::trace!(is_home_derp = *self.home_derp_rx.borrow());
                 },
 
                 from_net = from_dataplane.recv() => {
                     tracing::trace!("received packet to send");
-                    return from_net;
+
+                    return match from_net {
+                        Some((ep, pkts)) => Activity::Packets(ep, pkts),
+                        None => Activity::Closed,
+                    };
                 }
             }
         }
-
-        None
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
@@ -330,7 +353,12 @@ impl Runner {
                     }
                 },
 
-                _ = self.home_derp_rx.changed() => {
+                changed = self.home_derp_rx.changed() => {
+                    if changed.is_err() {
+                        tracing::trace!(parent: &span, "uniderp gone, closing derp conn");
+                        return Ok(());
+                    }
+
                     tracing::trace!(is_home_derp = *self.home_derp_rx.borrow());
                 },
             }
@@ -338,9 +366,104 @@ impl Runner {
     }
 }
 
+/// What [`Runner::wait_for_activity`] returned on.
+enum Activity {
+    /// The dataplane queued packets for this region.
+    Packets(DynEndpoint, Vec<PacketMut>),
+    /// This region became the home derp.
+    HomeDerp,
+    /// The `Uniderp` or the dataplane queue is gone: nothing can arrive any more.
+    Closed,
+}
+
 async fn option_timeout(duration: Option<Instant>) {
     match duration {
         Some(dur) => tokio::time::sleep_until(dur.into()).await,
         None => core::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::num::NonZeroU32;
+
+    use super::*;
+
+    /// A runner of a region with no servers, and the ends of its channels the `Uniderp` and
+    /// the dataplane hold.
+    fn runner(
+        is_home_derp: bool,
+    ) -> (
+        Runner,
+        watch::Sender<bool>,
+        Tx<ToUnderlay>,
+        Rx<FromUnderlay>,
+    ) {
+        let (home_derp_tx, home_derp_rx) = watch::channel(is_home_derp);
+        let (to_underlay_tx, to_underlay_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (from_underlay_tx, from_underlay_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let runner = Runner {
+            region_id: RegionId(NonZeroU32::new(1).unwrap()),
+            region: DerpRegion {
+                info: ts_derp::RegionInfo {
+                    name: "test".into(),
+                    code: "test".into(),
+                    no_measure_no_home: false,
+                },
+                servers: vec![],
+            },
+            transport_id: UnderlayTransportId(1),
+            home_derp_rx,
+            to_dataplane: from_underlay_tx,
+            from_dataplane: Arc::new(Mutex::new(to_underlay_rx)),
+            peer_db: Arc::new(RwLock::new(None)),
+            keys: NodeKeyPair::random(),
+        };
+
+        (runner, home_derp_tx, to_underlay_tx, from_underlay_rx)
+    }
+
+    /// Runs `runner` to completion, failing if it is still running after a second.
+    async fn run_to_end(mut runner: Runner) -> Result<(), ts_derp::Error> {
+        tokio::time::timeout(Duration::from_secs(1), runner.run())
+            .await
+            .expect("derp runner still running after its uniderp or dataplane went away")
+    }
+
+    #[tokio::test]
+    async fn runner_stops_when_uniderp_is_dropped() {
+        let (runner, home_derp_tx, _to_underlay, _from_underlay) = runner(false);
+        drop(home_derp_tx);
+
+        run_to_end(runner).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn home_runner_stops_without_connecting_when_uniderp_is_dropped() {
+        // Connecting to a region with no servers panics, so returning means no connect was
+        // tried.
+        let (runner, home_derp_tx, _to_underlay, _from_underlay) = runner(true);
+        drop(home_derp_tx);
+
+        run_to_end(runner).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runner_stops_when_uniderp_drops_while_it_waits() {
+        let (runner, home_derp_tx, _to_underlay, _from_underlay) = runner(false);
+        let run = tokio::spawn(run_to_end(runner));
+        tokio::task::yield_now().await;
+        drop(home_derp_tx);
+
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn runner_stops_when_dataplane_queue_closes() {
+        let (runner, _home_derp_tx, to_underlay, _from_underlay) = runner(false);
+        drop(to_underlay);
+
+        run_to_end(runner).await.unwrap();
     }
 }
