@@ -132,8 +132,7 @@ impl PeerDb {
             &mut self.index_state.disco_idx,
             |old, idx| {
                 if let Some(key) = &old.disco_key {
-                    let old_id = idx.remove(key);
-                    assert!(old_id.is_some_and(|old_id| old_id == id));
+                    unindex(idx, key, id);
                 }
             },
             |new, idx| {
@@ -161,13 +160,10 @@ impl PeerDb {
             |x| (&x.hostname, &x.tailnet),
             &mut self.index_state.name_idx,
             |old, idx| {
-                if idx.get(&old.hostname).is_some_and(|&x| x == id) {
-                    idx.remove(&old.hostname);
-                }
+                unindex(idx, &old.hostname, id);
 
                 if let Some(fqdn) = old.fqdn_opt(false) {
-                    let removed_id = idx.remove(&fqdn);
-                    assert!(removed_id.is_some_and(|removed_id| removed_id == id));
+                    unindex(idx, &fqdn, id);
                 }
             },
             |new, idx| {
@@ -185,11 +181,8 @@ impl PeerDb {
             |x| &x.tailnet_address,
             &mut self.index_state.ip_idx,
             |old, idx| {
-                let id4 = idx.remove(old.tailnet_address.ipv4.into());
-                let id6 = idx.remove(old.tailnet_address.ipv6.into());
-
-                assert!(id4.is_some_and(|old_id| old_id == id));
-                assert!(id6.is_some_and(|old_id| old_id == id));
+                unindex_addr(idx, old.tailnet_address.ipv4.into(), id);
+                unindex_addr(idx, old.tailnet_address.ipv6.into(), id);
             },
             |new, idx| {
                 idx.insert(new.tailnet_address.ipv4.into(), id);
@@ -282,18 +275,15 @@ impl PeerDb {
 
 impl IndexState {
     fn remove(&mut self, id: PeerId, node: &Node) {
-        self.nk_idx.remove(&node.node_key);
-        self.stableid_idx.remove(&node.stable_id);
-        self.control_idx.remove(&node.id);
-        self.ip_idx.remove(node.tailnet_address.ipv4.into());
-        self.ip_idx.remove(node.tailnet_address.ipv6.into());
-
-        if self.name_idx.get(&node.hostname).is_some_and(|&x| x == id) {
-            self.name_idx.remove(&node.hostname);
-        }
+        unindex(&mut self.nk_idx, &node.node_key, id);
+        unindex(&mut self.stableid_idx, &node.stable_id, id);
+        unindex(&mut self.control_idx, &node.id, id);
+        unindex_addr(&mut self.ip_idx, node.tailnet_address.ipv4.into(), id);
+        unindex_addr(&mut self.ip_idx, node.tailnet_address.ipv6.into(), id);
+        unindex(&mut self.name_idx, &node.hostname, id);
 
         if let Some(fqdn) = node.fqdn_opt(false) {
-            self.name_idx.remove(&fqdn);
+            unindex(&mut self.name_idx, &fqdn, id);
         }
 
         for route in &node.accepted_routes {
@@ -301,7 +291,7 @@ impl IndexState {
         }
 
         if let Some(disco) = &node.disco_key {
-            self.disco_idx.remove(disco);
+            unindex(&mut self.disco_idx, disco, id);
         }
     }
 
@@ -309,18 +299,7 @@ impl IndexState {
     fn remove_route(&mut self, route: ipnet::IpNet, id: PeerId) {
         self.route_idx.modify(route, |val| match val {
             Some(val) => {
-                let mut some_matched = false;
-
-                val.retain(|&mut x| {
-                    let ids_match = x == id;
-                    if ids_match {
-                        some_matched = true;
-                    }
-
-                    !ids_match
-                });
-
-                assert!(some_matched);
+                val.retain(|&mut x| x != id);
 
                 if val.is_empty() {
                     RouteModification::Remove
@@ -376,6 +355,35 @@ fn maybe_update<'n, T, Idx>(
     insert(new, idx)
 }
 
+/// Drop `key` from `idx` when the entry is `id`'s.
+///
+/// Control can hand two peers one value the db indexes as unique — a device
+/// registered again under a new stable id with the disco key of the one it
+/// replaces, say — and the later upsert then owns the entry. The earlier
+/// peer's update or removal leaves it where it is.
+fn unindex<T: Eq + Hash>(idx: &mut Index<T>, key: &T, id: PeerId) {
+    match idx.get(key) {
+        Some(&owner) if owner == id => {
+            idx.remove(key);
+        }
+        Some(&owner) => tracing::debug!(
+            ?id,
+            ?owner,
+            "an indexed value is shared by two peers; the entry stays with the later one"
+        ),
+        None => {}
+    }
+}
+
+/// [`unindex`] for an address index, whose entries are removed by prefix.
+fn unindex_addr(idx: &mut ts_bart::Table<PeerId>, key: ipnet::IpNet, id: PeerId) {
+    if let Some(owner) = idx.remove(key)
+        && owner != id
+    {
+        idx.insert(key, owner);
+    }
+}
+
 /// Specialization of [`maybe_update`] to work on [`Index`].
 fn maybe_update_idx<T>(
     new: &Node,
@@ -392,8 +400,7 @@ fn maybe_update_idx<T>(
         &accessor,
         idx,
         |old, idx| {
-            let old_id = idx.remove(accessor(old));
-            assert!(old_id.is_some_and(|old_id| old_id == new_id));
+            unindex(idx, accessor(old), new_id);
         },
         |new, idx| {
             idx.insert(accessor(new).clone(), new_id);
@@ -540,6 +547,27 @@ mod test {
                 .collect(),
             node_capabilities: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_disco_key_two_peers_share_stays_with_the_later_one() {
+        let mut db = PeerDb::default();
+        let mut first = rand_node();
+        first.disco_key = Some(DiscoPublicKey::random());
+        let mut second = rand_node();
+        second.disco_key = first.disco_key;
+        let first_id = db.upsert(&first);
+        let second_id = db.upsert(&second);
+        let disco = second.disco_key.unwrap();
+        assert_eq!(disco.lookup(&db), Some(second_id));
+
+        // The earlier peer changes, then goes: the entry is still the later one's.
+        let mut changed = first.clone();
+        changed.disco_key = None;
+        assert_eq!(db.upsert(&changed), first_id);
+        assert_eq!(disco.lookup(&db), Some(second_id));
+        assert!(db.remove(&first_id).is_some());
+        assert_eq!(disco.lookup(&db), Some(second_id));
     }
 
     fn validate_indices(db: &PeerDb, node: &Node, id: PeerId) {
